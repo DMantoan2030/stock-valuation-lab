@@ -1,0 +1,11 @@
+# Never upload API keys or personal contact details
+.streamlit/secrets.toml
+.env
+
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+
+# Local tool settings
+.claude/
