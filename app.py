@@ -32,7 +32,7 @@ def secret(name: str, default: str = "") -> str:
     if os.environ.get(name):
         return os.environ[name]
     try:
-        return st.secrets.get(name, default)
+        return st.secrets.get(name, default) or default   # an empty value falls back to the default
     except Exception:
         return default
 
