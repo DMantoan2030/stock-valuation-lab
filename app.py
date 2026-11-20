@@ -289,10 +289,18 @@ def render_scan() -> None:
         return
 
     sort = st.radio("Rank by", list(SORTS), horizontal=True, key="scan_sort")
+    sectors = sorted({r.sector for r in rows if r.sector})
+    chosen = st.multiselect("Filter by sector", sectors, placeholder="All sectors", key="scan_sectors")
+    if chosen:
+        rows = [r for r in rows if r.sector in chosen]
     rows = sorted(rows, key=SORTS[sort])
     st.session_state["scan_order"] = [r.ticker for r in rows]
+    if not rows:
+        st.write("No companies in the selected sectors.")
+        return
     df = pd.DataFrame([{
-        "Ticker": r.ticker, "Company": r.name, "Price": r.price, "DCF value": r.dcf_value, "Upside": r.upside,
+        "Ticker": r.ticker, "Company": r.name, "Sector": r.sector, "Industry": r.industry,
+        "Price": r.price, "DCF value": r.dcf_value, "Upside": r.upside,
         "Implied growth": r.implied_growth, "3-yr CAGR": r.cagr_3y, "Growth gap": r.growth_gap,
         "P/E": r.pe, "Altman Z": r.altman_z, "Z zone": scan.z_zone(r.altman_z),
         "Interest cover": r.interest_coverage, "Net debt/EBITDA": r.net_debt_ebitda, "FCF margin": r.fcf_margin,
@@ -316,6 +324,9 @@ def render_scan() -> None:
             "Interest cover": cc.NumberColumn(format="%.1fx", help="EBIT / interest expense; below 1.5x is a warning"),
             "Net debt/EBITDA": cc.NumberColumn(format="%.1fx", help="Above 4x is a warning"),
             "Distress flags": cc.NumberColumn(help="Number of warning signs (see 'Why flagged')"),
+            "Sector": cc.TextColumn(help="Approximate GICS-style sector, derived from the company's SEC industry "
+                                         "(SIC) code"),
+            "Industry": cc.TextColumn(help="The company's official SEC industry classification (SIC)"),
         })
     st.caption("Click a row to open that company's full analysis. Values use default assumptions "
                "(3-year revenue CAGR, current margin, CAPM WACC, 2.5% terminal growth), so treat the ranking "

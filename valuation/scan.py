@@ -26,6 +26,46 @@ from .sec import CompanySnapshot
 
 MAX_TICKERS = 60
 
+# Approximate GICS-style sector from the SEC's 4-digit SIC industry code.
+# Checked in order; the first matching range wins, so narrow exceptions come first.
+_SECTOR_RANGES: list[tuple[int, int, str]] = [
+    (1220, 1229, "Energy"), (1300, 1399, "Energy"), (2900, 2999, "Energy"),
+    (2830, 2836, "Health Care"), (3840, 3851, "Health Care"), (5122, 5122, "Health Care"),
+    (8000, 8099, "Health Care"),
+    (2840, 2844, "Consumer Staples"), (5400, 5499, "Consumer Staples"), (5912, 5912, "Consumer Staples"),
+    (5331, 5331, "Consumer Staples"), (5141, 5149, "Consumer Staples"),
+    (3570, 3579, "Information Technology"), (3600, 3629, "Information Technology"),
+    (3640, 3699, "Information Technology"), (3800, 3839, "Information Technology"),
+    (7370, 7379, "Information Technology"),
+    (3630, 3639, "Consumer Discretionary"), (3710, 3716, "Consumer Discretionary"),
+    (3750, 3751, "Consumer Discretionary"), (3790, 3799, "Consumer Discretionary"),
+    (3860, 3999, "Consumer Discretionary"),
+    (2700, 2799, "Communication Services"), (4800, 4899, "Communication Services"),
+    (7810, 7829, "Communication Services"),
+    (4900, 4999, "Utilities"),
+    (6798, 6798, "Real Estate"), (6500, 6599, "Real Estate"),
+    (6000, 6499, "Financials"), (6700, 6799, "Financials"),
+    (100, 999, "Consumer Staples"), (1000, 1499, "Materials"), (1500, 1799, "Industrials"),
+    (2000, 2199, "Consumer Staples"), (2200, 2399, "Consumer Discretionary"), (2400, 2499, "Materials"),
+    (2500, 2599, "Consumer Discretionary"), (2600, 2699, "Materials"), (2800, 2899, "Materials"),
+    (3000, 3199, "Consumer Discretionary"), (3200, 3399, "Materials"), (3400, 3599, "Industrials"),
+    (3700, 3799, "Industrials"), (4000, 4799, "Industrials"), (5000, 5199, "Industrials"),
+    (5200, 5999, "Consumer Discretionary"), (7000, 7299, "Consumer Discretionary"),
+    (7300, 7399, "Industrials"), (7800, 7999, "Consumer Discretionary"),
+    (8200, 8299, "Consumer Discretionary"), (8700, 8799, "Industrials"),
+]
+
+
+def sector_from_sic(sic: str | int | None) -> str:
+    try:
+        code = int(sic)
+    except (TypeError, ValueError):
+        return "Unknown"
+    for lo, hi, sector in _SECTOR_RANGES:
+        if lo <= code <= hi:
+            return sector
+    return "Other"
+
 _TICKER = re.compile(r"^[A-Z]{1,5}([.\-][A-Z]{1,2})?$")
 
 
@@ -109,6 +149,8 @@ class ScanRow:
     fcf_margin: float | None = None
     distress_flags: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    sector: str = ""
+    industry: str = ""
 
     @property
     def distress_score(self) -> int:
@@ -117,6 +159,8 @@ class ScanRow:
 
 def analyze(snap: CompanySnapshot, price: float | None, beta: float | None, rf: float) -> ScanRow:
     row = ScanRow(snap.ticker, snap.name, price)
+    row.sector = sector_from_sic(snap.sic)
+    row.industry = snap.sic_description.title() if snap.sic_description else ""
     d = snap.defaults
     row.cagr_3y = d.get("cagr_3y")
     shares = snap.v("shares")

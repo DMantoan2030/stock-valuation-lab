@@ -65,3 +65,21 @@ def test_healthy_company_has_no_flags():
                          fcf=150.0, debt=100.0, cash=50.0, shares=10.0, eps_diluted=15.0)
     row = scan.analyze(snap, price=200.0, beta=1.0, rf=0.045)
     assert row.distress_flags == []
+
+
+@pytest.mark.parametrize("sic,sector", [
+    ("3571", "Information Technology"),   # Apple: electronic computers
+    ("7372", "Information Technology"),   # Microsoft: prepackaged software
+    ("2080", "Consumer Staples"),         # Coca-Cola: beverages
+    ("3021", "Consumer Discretionary"),   # Nike: rubber & plastics footwear
+    ("3711", "Consumer Discretionary"),   # Ford: motor vehicles
+    ("5331", "Consumer Staples"),         # Costco: variety stores
+    ("6021", "Financials"),               # JPMorgan: national commercial banks
+    ("6798", "Real Estate"),              # REITs
+    ("2834", "Health Care"),              # pharmaceutical preparations
+    ("1311", "Energy"),                   # crude petroleum & natural gas
+    ("4911", "Utilities"),                # electric services
+    ("", "Unknown"),
+])
+def test_sector_from_sic(sic, sector):
+    assert scan.sector_from_sic(sic) == sector
