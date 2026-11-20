@@ -10,7 +10,7 @@ from dataclasses import replace
 import pandas as pd
 import streamlit as st
 
-from valuation import market, sec
+from valuation import filing, market, sec
 from valuation.model import (FCF_FORMULA, MIN_SPREAD, DCFInputs, peer_pe_value, reverse_dcf, run_dcf,
                              sensitivity, trailing_pe, wacc_capm)
 from valuation.peers import suggest_peers
@@ -74,6 +74,18 @@ def _cached_snapshot(ticker: str, version: int) -> sec.CompanySnapshot:
 
 def load_snapshot(ticker: str) -> sec.CompanySnapshot:
     return _cached_snapshot(ticker, SNAPSHOT_VERSION)
+
+
+OVERVIEW_VERSION = 2
+
+
+@st.cache_data(ttl=24 * 3600, show_spinner=False)
+def _cached_overview(ticker: str, version: int) -> filing.CompanyOverview:
+    return filing.build_overview(ticker, SEC_UA, load_ticker_map())
+
+
+def load_overview(ticker: str) -> filing.CompanyOverview:
+    return _cached_overview(ticker, OVERVIEW_VERSION)
 
 
 # Finnhub results are cached so repeat lookups cost no requests. Failures raise inside
@@ -388,8 +400,8 @@ if dcf_error:
 if snap.flags:
     st.caption(f"⚠️ {len(snap.flags)} data-quality note(s). See the **Sources & data quality** tab.")
 
-tab_dcf, tab_rev, tab_peers, tab_src, tab_method = st.tabs(
-    ["DCF", "Reverse DCF", "P/E & competitors", "Sources & data quality", "Methodology"])
+tab_dcf, tab_rev, tab_peers, tab_src, tab_method, tab_company = st.tabs(
+    ["DCF", "Reverse DCF", "P/E & competitors", "Sources & data quality", "Methodology", "Company overview"])
 
 # ---------------------------------------------------------------------------
 # DCF tab
@@ -680,3 +692,104 @@ Holds every assumption fixed except revenue growth, then solves for the single c
 - Foreign filers (20-F) are not supported.
 - One-time items can distort EPS.
 """)
+
+# ---------------------------------------------------------------------------
+# Company overview tab (from the latest 10-K, quoted word for word)
+# ---------------------------------------------------------------------------
+
+
+def quote_block(paras: list[str]) -> None:
+    for p in paras:
+        st.markdown("> " + p.replace("$", r"\$"))   # stop "$" from being read as math notation
+
+
+with tab_company:
+    try:
+        with st.spinner("Reading the latest 10-K..."):
+            ov = load_overview(ticker)
+    except Exception as e:  # noqa: BLE001
+        st.error(f"Could not read the 10-K for {ticker}: {e}")
+        ov = None
+
+    if ov is not None:
+        if ov.url:
+            st.caption(f"Source: [{ov.form} for fiscal year ending {ov.period}]({ov.url}), filed {ov.filed}. "
+                       "Every excerpt below is quoted word for word from the filing. Excerpts are picked by "
+                       "simple rules (section headings and keywords), not by AI, so read the full sections "
+                       "at the bottom for complete context.")
+        for n in ov.notes:
+            st.info(n)
+
+        if ov.url:
+            st.markdown("#### What the company does")
+            st.caption("Opening paragraphs of Item 1, Business")
+            if ov.what_it_does:
+                quote_block(ov.what_it_does)
+            else:
+                st.write("Not found.")
+
+            st.markdown("#### Strategy")
+            if ov.strategy:
+                st.caption(f"From the section \"{ov.strategy_heading}\"" if ov.strategy_heading
+                           else "Paragraphs that state the company's strategy or priorities")
+                quote_block(ov.strategy)
+            else:
+                st.write("This 10-K does not include an explicit strategy statement.")
+
+            st.markdown("#### Main revenue streams")
+            if ov.revenue_table:
+                rows = ov.revenue_table
+                width = max(len(r) for r in rows)
+                rows = [r + [""] * (width - len(r)) for r in rows]
+                header = rows[0] if filing._is_header([c for c in rows[0] if c]) else None
+                body = rows[1:] if header else rows
+                cols = [c or " " * (i + 1) for i, c in enumerate(header)] if header else \
+                    [" "] + [f"col {i}" for i in range(1, width)]
+                # make duplicate column names (e.g. two "Change" columns) unique
+                seen: dict[str, int] = {}
+                for i, c in enumerate(cols):
+                    seen[c] = seen.get(c, 0) + 1
+                    if seen[c] > 1:
+                        cols[i] = f"{c} ({seen[c]})"
+                st.dataframe(pd.DataFrame(body, columns=cols), hide_index=True, width="stretch")
+                total = filing.table_total(ov.revenue_table)
+                rev_m = (snap.v("revenue") or 0) / 1e6
+                if total and rev_m and total < 0.8 * rev_m and total * 1000 > 1.2 * rev_m:
+                    st.warning(f"This table totals {total:,.0f} (millions), but the company's revenue is about "
+                               f"{rev_m:,.0f} million, so it likely covers only one segment. "
+                               "See the MD&A for the full breakdown.")
+                else:
+                    st.caption("Revenue breakdown table from the MD&A, as reported (usually in $ millions). "
+                               "The rows were checked to add up to the total.")
+            else:
+                st.caption("No revenue breakdown table was found whose rows add up to the total.")
+            quote_block(ov.revenue)
+
+            st.markdown("#### Management's overview (MD&A)")
+            if ov.mdna_overview:
+                quote_block(ov.mdna_overview)
+            else:
+                st.write("Not found.")
+
+            st.markdown("#### What it is struggling with")
+            if ov.struggles:
+                st.caption(f"From the MD&A section \"{ov.struggles_heading}\"" if ov.struggles_heading
+                           else "MD&A paragraphs that mention declines, pressures or challenges most often")
+                quote_block(ov.struggles)
+            else:
+                st.write("Not found.")
+
+            st.markdown("#### Top risk factors (Item 1A headlines)")
+            if ov.risk_headlines:
+                st.markdown("\n".join(f"- {h.replace('$', chr(92) + '$')}" for h in ov.risk_headlines))
+            else:
+                st.write("Not found.")
+
+            st.markdown("#### Read the full sections")
+            for name, body in ov.sections.items():
+                with st.expander(f"{name} ({len(body.split()):,} words)"):
+                    if body:
+                        st.text(body[:60_000] + ("\n\n[Truncated. Open the full filing for the rest.]"
+                                                 if len(body) > 60_000 else ""))
+                    else:
+                        st.write("Not found in this filing.")

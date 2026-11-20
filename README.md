@@ -6,6 +6,8 @@ A web app that values any U.S.-listed company three ways, using data pulled dire
 2. **Reverse DCF**: the annual revenue growth that today's stock price implies
 3. **P/E comparison**: trailing P/E against 3 to 5 suggested competitors (which you can replace)
 
+**Version 2 (this branch)** adds a **Company overview** tab built from the latest 10-K: what the company does, its strategy, revenue breakdown, management's overview, what it is struggling with, and its top risk factors. Every excerpt is quoted word for word and picked by simple, transparent rules (section headings and keywords), not by AI. The full Business, Risk Factors and MD&A sections can be read in the app.
+
 Every assumption can be adjusted. Every input shows the filing it came from, its period and its filing date. Missing or unreliable data is flagged, never invented.
 
 > **Educational use only. This is not investment advice.**
