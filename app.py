@@ -221,10 +221,19 @@ def _open_from_scan() -> None:
         st.session_state["view"] = VIEWS[0]
 
 
+# Bump when the store's code changes: Streamlit keeps cached objects across updates, and an
+# object built by older code would be missing newer methods.
+STORE_VERSION = 2
+
+
 @st.cache_resource
-def scan_store() -> store.ScanStore:
-    """One store shared by all visitors; each person's scans are grouped under their private key."""
+def _scan_store(version: int) -> store.ScanStore:
     return store.ScanStore()
+
+
+def scan_store() -> store.ScanStore:
+    """One store for the app, kept in memory; saved scans are grouped under STORE_KEY."""
+    return _scan_store(STORE_VERSION)
 
 
 def _ago(created) -> str:
