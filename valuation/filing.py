@@ -456,7 +456,7 @@ def build_overview(ticker: str, user_agent: str, ticker_map: dict) -> CompanyOve
     shown = set(ov.what_it_does) | set(ov.strategy)
     ov.mdna_overview = [p for p in mdna_overview(mdna, 6) if p not in shown][:4]
 
-    # What it is struggling with: a "Challenges" / "Factors impacting" heading in MD&A if
+    # Risks: a "Challenges" / "Factors impacting" heading in MD&A if
     # there is one, otherwise the MD&A paragraphs with the most problem-related words
     heading, paras = paragraphs_after_heading(mdna, STRUGGLE_HEADINGS, 4)
     ov.struggles_heading = heading

@@ -771,7 +771,7 @@ with tab_company:
             else:
                 st.write("Not found.")
 
-            st.markdown("#### What it is struggling with")
+            st.markdown("#### Risks")
             if ov.struggles:
                 st.caption(f"From the MD&A section \"{ov.struggles_heading}\"" if ov.struggles_heading
                            else "MD&A paragraphs that mention declines, pressures or challenges most often")
