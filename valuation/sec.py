@@ -430,6 +430,7 @@ class CompanySnapshot:
     points: dict[str, DataPoint] = field(default_factory=dict)
     history: dict[str, dict[str, float]] = field(default_factory=dict)
     defaults: dict[str, float] = field(default_factory=dict)
+    balance: dict[str, float | None] = field(default_factory=dict)   # latest balance sheet, for distress metrics
     flags: list[str] = field(default_factory=list)
     dcf_supported: bool = True
 
@@ -506,6 +507,27 @@ def build_snapshot(ticker: str, user_agent: str, ticker_map: dict) -> CompanySna
     else:
         snap.points["cash"] = DataPoint("Cash & short-term investments", None, "missing", cik=cik)
         snap.points["debt"] = DataPoint("Total debt", None, "missing", cik=cik)
+
+    # Extra balance-sheet items for the watchlist scan's distress metrics (Altman Z-score)
+    if bdate:
+        def at(*tags):
+            hit = _first_at(facts, list(tags), bdate)
+            return hit[0] if hit else None
+        total_assets = at("Assets")
+        liabilities = at("Liabilities")
+        if liabilities is None:
+            l_and_e = at("LiabilitiesAndStockholdersEquity")
+            equity = at("StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+                        "StockholdersEquity")
+            liabilities = l_and_e - equity if l_and_e is not None and equity is not None else None
+        snap.balance = {
+            "as_of": str(bdate),
+            "total_assets": total_assets,
+            "total_liabilities": liabilities,
+            "current_assets": at("AssetsCurrent"),
+            "current_liabilities": at("LiabilitiesCurrent"),
+            "retained_earnings": at("RetainedEarningsAccumulatedDeficit"),
+        }
 
     snap.points["shares"] = diluted_shares(facts, cik)
 

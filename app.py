@@ -5,13 +5,15 @@ Run locally with:  streamlit run app.py
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import replace
 
 import pandas as pd
 import streamlit as st
 
-from valuation import filing, market, sec
-from valuation.model import (FCF_FORMULA, MIN_SPREAD, DCFInputs, peer_pe_value, reverse_dcf, run_dcf,
+from valuation import filing, market, scan, sec
+from valuation.defaults import DEFAULT_ERP, DEFAULT_TG, default_inputs, default_wacc
+from valuation.model import (FCF_FORMULA, MIN_SPREAD, peer_pe_value, reverse_dcf, run_dcf,
                              sensitivity, trailing_pe, wacc_capm)
 from valuation.peers import suggest_peers
 
@@ -32,8 +34,6 @@ st.markdown("""
 DISCLAIMER = ("**Educational use only. This is not investment advice.** Results depend entirely on the "
               "assumptions entered and on automatically extracted data, which may be incomplete or wrong. "
               "Always verify inputs against the original SEC filings.")
-DEFAULT_ERP = 0.05
-DEFAULT_TG = 0.025
 
 
 # ---------------------------------------------------------------------------
@@ -64,7 +64,7 @@ def load_ticker_map() -> dict:
 
 # Bump this whenever the company snapshot gains new fields, so data saved by an older
 # version of the app is not reused after a redeploy.
-SNAPSHOT_VERSION = 3
+SNAPSHOT_VERSION = 4
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
@@ -167,39 +167,25 @@ def multiple(x: float | None) -> str:
 # Default assumptions shared by the main company and its peers
 # ---------------------------------------------------------------------------
 
-def default_wacc(snap: sec.CompanySnapshot, price: float | None, beta: float | None,
-                 rf: float, erp: float) -> tuple[float, dict]:
-    tax = snap.defaults.get("tax_rate", 0.21)
-    kd = snap.defaults.get("cost_of_debt") or rf + 0.015
-    shares = snap.v("shares") or 0
-    mcap = (price or 0) * shares
-    b = beta if beta else 1.0
-    w = wacc_capm(rf, b, erp, kd, tax, mcap, snap.v("debt") or 0.0)
-    wacc = min(max(w.wacc, 0.05), 0.15)
-    return wacc, {"beta": b, "beta_estimated": beta is None, "kd": kd, "detail": w, "clipped": wacc != w.wacc}
-
-
-def default_inputs(snap: sec.CompanySnapshot, wacc: float, tg: float = DEFAULT_TG) -> DCFInputs:
-    d = snap.defaults
-    g1 = d.get("growth_y1", 0.05)
-    return DCFInputs(
-        revenue=snap.v("revenue") or 0.0, margin_start=d.get("op_margin", 0.1), margin_target=d.get("op_margin", 0.1),
-        growth_y1=g1, growth_y5=(g1 + tg) / 2, tax_rate=d.get("tax_rate", 0.21), da_pct=d.get("da_pct", 0.03),
-        capex_pct=d.get("capex_pct", 0.04), nwc_pct=d.get("nwc_pct", 0.05), wacc=wacc, terminal_growth=tg,
-        cash=snap.v("cash") or 0.0, debt=snap.v("debt") or 0.0, shares=snap.v("shares") or 0.0,
-    )
-
-
 # ---------------------------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------------------------
 
+VIEWS = ["Single company", "Watchlist scan"]
+st.session_state.setdefault("view", VIEWS[0])
+
+
+def _switch_to_single() -> None:
+    st.session_state["view"] = VIEWS[0]
+
+
 with st.sidebar:
     st.header("📈 Stock Valuation Lab")
+    st.radio("View", VIEWS, key="view", horizontal=True)
     with st.form("ticker_form"):
         ticker_in = st.text_input("U.S. stock ticker", value=st.session_state.get("ticker", ""),
                                   placeholder="e.g. AAPL, KO, MSFT").upper().strip()
-        go = st.form_submit_button("Analyze", type="primary", width="stretch")
+        go = st.form_submit_button("Analyze", type="primary", width="stretch", on_click=_switch_to_single)
     if go and ticker_in:
         st.session_state["ticker"] = ticker_in
     st.caption("Try: AAPL · MSFT · KO · NKE · COST")
@@ -209,6 +195,142 @@ with st.sidebar:
                 f"- Prices, beta, peers: Finnhub {'✅' if FINNHUB_KEY else '⚠️ no API key (enter prices manually)'}")
     st.divider()
     st.warning(DISCLAIMER)
+
+
+# ---------------------------------------------------------------------------
+# Watchlist scan view
+# ---------------------------------------------------------------------------
+
+SORTS = {
+    "Most upside": lambda r: -(r.upside if r.upside is not None else -9),
+    "Most distressed": lambda r: (-r.distress_score, r.altman_z if r.altman_z is not None else 99),
+    "Price implies faster growth than history": lambda r: -(r.growth_gap if r.growth_gap is not None else -9),
+    "Price implies slower growth than history": lambda r: (r.growth_gap if r.growth_gap is not None else 9),
+}
+
+
+def _open_from_scan() -> None:
+    """Clicking a row in the scan table opens that company in the single-company view."""
+    sel = st.session_state["scan_table"].selection.rows
+    if sel:
+        st.session_state["ticker"] = st.session_state["scan_order"][sel[0]]
+        st.session_state["view"] = VIEWS[0]
+
+
+def run_scan(tickers: list[str]) -> list[scan.ScanRow]:
+    rf = load_risk_free().rate
+    rows: list[scan.ScanRow] = []
+    bar = st.progress(0.0, text="Starting scan...")
+    window_start, live_calls = time.time(), 0
+    for i, t in enumerate(tickers):
+        bar.progress(i / len(tickers), text=f"Analyzing {t} ({i + 1} of {len(tickers)})")
+        try:
+            snap = load_snapshot(t)
+        except Exception as e:  # noqa: BLE001
+            r = scan.ScanRow(t)
+            r.notes.append(f"SEC data unavailable: {e}")
+            rows.append(r)
+            continue
+        price = beta = None
+        if FINNHUB_KEY:
+            # Finnhub's free tier allows 60 requests per minute. Requests answered from the
+            # app's saved data are instant and do not count; for live ones, pause before
+            # the minute's allowance runs out.
+            if live_calls >= 50 and time.time() - window_start < 60:
+                wait = 61 - (time.time() - window_start)
+                bar.progress(i / len(tickers), text=f"Pausing {wait:.0f}s for Finnhub's 60-requests-per-minute limit...")
+                time.sleep(wait)
+            if time.time() - window_start >= 60:
+                window_start, live_calls = time.time(), 0
+            t0 = time.time()
+            quote, _ = load_quote(t)
+            beta = load_beta(t)
+            if time.time() - t0 > 0.05:
+                live_calls += 2
+            price = quote.price if quote else None
+        rows.append(scan.analyze(snap, price, beta, rf))
+    bar.empty()
+    return rows
+
+
+def render_scan() -> None:
+    st.title("Watchlist scan")
+    st.markdown(
+        "Value every company on a watchlist with the app's default assumptions, then rank them by upside, "
+        "financial distress, or the gap between the growth the stock price implies and the company's "
+        "3-year revenue CAGR. **Click any row to open the full single-company analysis.**")
+    with st.expander("How to get your tickers in"):
+        st.markdown(
+            "- **Paste:** type or paste tickers in any format (commas, spaces or one per line). If your "
+            "thinkorswim watchlist lets you select and copy the symbol column, paste it straight in.\n"
+            "- **Upload a CSV:** for example, Schwab.com → Accounts → Positions → *Export* downloads your holdings "
+            "as a CSV. Any CSV with a *Symbol* column works.\n\n"
+            "Options, futures and anything not registered with the SEC are skipped automatically.")
+    c1, c2 = st.columns(2)
+    up = c1.file_uploader("Watchlist or positions file (CSV)", type=["csv", "txt"])
+    pasted = c2.text_area("...or paste tickers", placeholder="AAPL, MSFT, KO, NKE, COST", height=110)
+    text = (up.getvalue().decode("utf-8", errors="ignore") if up else "") + "\n" + (pasted or "")
+    tickers, skipped = scan.parse_tickers(text, load_ticker_map()) if text.strip() else ([], [])
+    if len(tickers) > scan.MAX_TICKERS:
+        st.warning(f"{len(tickers)} tickers found; scanning the first {scan.MAX_TICKERS}.")
+        tickers = tickers[:scan.MAX_TICKERS]
+    if tickers:
+        st.caption(f"{len(tickers)} ticker(s) ready: {', '.join(tickers)}"
+                   + (f" · skipped (not SEC-registered): {', '.join(skipped)}" if skipped else ""))
+        est = max(1, round(len(tickers) * 2 / 50))
+        st.caption(f"A first scan takes roughly {est} minute(s) because of Finnhub's free-tier limit; "
+                   "rescans of the same tickers are fast.")
+    if st.button("Run scan", type="primary", disabled=not tickers):
+        st.session_state["scan_rows"] = run_scan(tickers)
+
+    rows: list[scan.ScanRow] = st.session_state.get("scan_rows") or []
+    if not rows:
+        st.info(DISCLAIMER)
+        return
+
+    sort = st.radio("Rank by", list(SORTS), horizontal=True, key="scan_sort")
+    rows = sorted(rows, key=SORTS[sort])
+    st.session_state["scan_order"] = [r.ticker for r in rows]
+    df = pd.DataFrame([{
+        "Ticker": r.ticker, "Company": r.name, "Price": r.price, "DCF value": r.dcf_value, "Upside": r.upside,
+        "Implied growth": r.implied_growth, "3-yr CAGR": r.cagr_3y, "Growth gap": r.growth_gap,
+        "P/E": r.pe, "Altman Z": r.altman_z, "Z zone": scan.z_zone(r.altman_z),
+        "Interest cover": r.interest_coverage, "Net debt/EBITDA": r.net_debt_ebitda, "FCF margin": r.fcf_margin,
+        "Distress flags": r.distress_score, "Why flagged": "; ".join(r.distress_flags),
+        "Notes": "; ".join(r.notes),
+    } for r in rows])
+    for col in ("Price", "DCF value", "Upside", "Implied growth", "3-yr CAGR", "Growth gap", "P/E", "Altman Z",
+                "Interest cover", "Net debt/EBITDA", "FCF margin"):
+        df[col] = pd.to_numeric(df[col], errors="coerce")      # missing values show as blank, not "None"
+    cc = st.column_config
+    st.dataframe(
+        df, key="scan_table", on_select=_open_from_scan, selection_mode="single-row", hide_index=True,
+        width="stretch",
+        column_config={
+            "Price": cc.NumberColumn(format="dollar"), "DCF value": cc.NumberColumn(format="dollar"),
+            "Upside": cc.NumberColumn(format="percent"), "Implied growth": cc.NumberColumn(format="percent"),
+            "3-yr CAGR": cc.NumberColumn(format="percent"), "FCF margin": cc.NumberColumn(format="percent"),
+            "Growth gap": cc.NumberColumn(format="percent",
+                                          help="Price-implied revenue growth minus the 3-year revenue CAGR"),
+            "P/E": cc.NumberColumn(format="%.1fx"), "Altman Z": cc.NumberColumn(format="%.2f"),
+            "Interest cover": cc.NumberColumn(format="%.1fx", help="EBIT / interest expense; below 1.5x is a warning"),
+            "Net debt/EBITDA": cc.NumberColumn(format="%.1fx", help="Above 4x is a warning"),
+            "Distress flags": cc.NumberColumn(help="Number of warning signs (see 'Why flagged')"),
+        })
+    st.caption("Click a row to open that company's full analysis. Values use default assumptions "
+               "(3-year revenue CAGR, current margin, CAPM WACC, 2.5% terminal growth), so treat the ranking "
+               "as a starting point for research. Altman Z zones: below 1.81 distress, 1.81 to 2.99 grey, "
+               "above 2.99 safe; it is not meaningful for banks, insurers or REITs.")
+    st.info(DISCLAIMER)
+
+
+if st.session_state["view"] == "Watchlist scan":
+    render_scan()
+    st.stop()
+
+if st.session_state.get("scan_rows"):
+    st.sidebar.button("← Back to watchlist scan", width="stretch",
+                      on_click=lambda: st.session_state.update(view=VIEWS[1]))
 
 ticker = st.session_state.get("ticker")
 
