@@ -24,7 +24,7 @@ from .defaults import default_inputs, default_wacc
 from .model import reverse_dcf, run_dcf, trailing_pe
 from .sec import CompanySnapshot
 
-MAX_TICKERS = 60
+MAX_TICKERS = 1000
 
 # Approximate GICS-style sector from the SEC's 4-digit SIC industry code.
 # Checked in order; the first matching range wins, so narrow exceptions come first.

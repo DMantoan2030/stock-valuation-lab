@@ -218,8 +218,11 @@ def _open_from_scan() -> None:
 
 
 def run_scan(tickers: list[str]) -> list[scan.ScanRow]:
+    """Results are written to the session as they arrive, so if the scan is stopped or
+    the user clicks away, the companies already analyzed are kept."""
     rf = load_risk_free().rate
     rows: list[scan.ScanRow] = []
+    st.session_state["scan_rows"] = rows
     bar = st.progress(0.0, text="Starting scan...")
     window_start, live_calls = time.time(), 0
     for i, t in enumerate(tickers):
@@ -275,13 +278,17 @@ def render_scan() -> None:
         st.warning(f"{len(tickers)} tickers found; scanning the first {scan.MAX_TICKERS}.")
         tickers = tickers[:scan.MAX_TICKERS]
     if tickers:
-        st.caption(f"{len(tickers)} ticker(s) ready: {', '.join(tickers)}"
-                   + (f" · skipped (not SEC-registered): {', '.join(skipped)}" if skipped else ""))
-        est = max(1, round(len(tickers) * 2 / 50))
-        st.caption(f"A first scan takes roughly {est} minute(s) because of Finnhub's free-tier limit; "
-                   "rescans of the same tickers are fast.")
+        shown = ", ".join(tickers[:40]) + (f" ... and {len(tickers) - 40} more" if len(tickers) > 40 else "")
+        st.caption(f"{len(tickers)} ticker(s) ready: {shown}"
+                   + (f" · skipped (not SEC-registered): {', '.join(skipped[:20])}" if skipped else ""))
+        # Finnhub's free tier allows about 25 new tickers a minute (2 requests each); SEC
+        # downloads take roughly 1.5 seconds per company. The slower of the two sets the pace.
+        est = max(1, round(max(len(tickers) * 2 / 50, len(tickers) * 1.5 / 60)))
+        msg = (f"A first scan takes about {est} minute(s); rescans of the same tickers are much faster. "
+               "Results appear as they finish, and anything already analyzed is kept if you stop the scan.")
+        (st.warning if est >= 5 else st.caption)(msg)
     if st.button("Run scan", type="primary", disabled=not tickers):
-        st.session_state["scan_rows"] = run_scan(tickers)
+        run_scan(tickers)
 
     rows: list[scan.ScanRow] = st.session_state.get("scan_rows") or []
     if not rows:
