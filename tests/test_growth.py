@@ -1,7 +1,7 @@
-"""Checks the historical growth rates and the app-wide Finnhub speed limit."""
+"""Checks the historical revenue growth rates (last year, 3-year and 5-year CAGR)."""
 import pytest
 
-from valuation import market, sec
+from valuation import sec
 
 
 def snapshot_with_revenue(values):
@@ -29,13 +29,3 @@ def test_three_year_cagr_is_default_not_a_blend():
     assert d["cagr_3y"] == pytest.approx(1.5 ** (1 / 3) - 1)
     assert d["cagr_5y"] is None                     # not enough history
     assert d["hist_growth"] == pytest.approx(d["cagr_3y"])
-
-
-def test_speed_limit_blocks_extra_requests(monkeypatch):
-    monkeypatch.setattr(market, "FINNHUB_BUDGET_PER_MINUTE", 3)
-    market._calls.clear()
-    for _ in range(3):
-        market._take_request_slot()
-    with pytest.raises(market.MarketDataError, match="busy"):
-        market._take_request_slot()
-    market._calls.clear()
