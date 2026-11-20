@@ -27,12 +27,11 @@ class PeerSuggestion:
 
 def suggest_peers(ticker: str, sic: str, market_cap: float | None, finnhub_key: str,
                   user_agent: str, ticker_map: dict, max_peers: int = 4,
-                  max_candidates: int = 12) -> tuple[list[PeerSuggestion], list[str]]:
+                  max_candidates: int = 8) -> tuple[list[PeerSuggestion], list[str]]:
+    """Raises market.MarketDataError if Finnhub is unavailable or busy, so a failed
+    attempt is never cached and the next visitor retries."""
     notes: list[str] = []
-    try:
-        candidates = market.get_peers(ticker, finnhub_key)
-    except market.MarketDataError as e:
-        return [], [f"Peer suggestions unavailable: {e}"]
+    candidates = market.get_peers(ticker, finnhub_key)
 
     candidates = [c for c in candidates if c in ticker_map][:max_candidates]
     if not candidates:
@@ -48,6 +47,8 @@ def suggest_peers(ticker: str, sic: str, market_cap: float | None, finnhub_key: 
         try:
             prof = market.get_profile(c, finnhub_key)
             mcap = float(prof["marketCapitalization"]) * 1e6 if prof.get("marketCapitalization") else None
+        except market.MarketDataError:
+            raise  # busy or rate-limited: fail the whole lookup rather than cache a partial ranking
         except Exception:
             mcap = None
 

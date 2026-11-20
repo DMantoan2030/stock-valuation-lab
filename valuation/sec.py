@@ -542,12 +542,19 @@ def _default_assumptions(snap: CompanySnapshot) -> dict[str, float]:
     rv = list(rev.values())
     last3 = list(rev.keys())[-3:]
 
-    # Revenue growth: blend of last-year growth and 3-year CAGR, kept in a sensible range.
-    g_last = rv[-1] / rv[-2] - 1 if len(rv) >= 2 and rv[-2] > 0 else None
-    cagr = (rv[-1] / rv[-4]) ** (1 / 3) - 1 if len(rv) >= 4 and rv[-4] > 0 and rv[-1] > 0 else None
-    g = _avg([g_last, cagr])
-    d["hist_growth"] = g if g is not None else 0.05
-    d["growth_y1"] = _clip(d["hist_growth"], -0.10, 0.25)
+    # Historical revenue growth from fiscal-year (10-K) revenue.
+    def cagr(years: int) -> float | None:
+        if len(rv) > years and rv[-1 - years] > 0 and rv[-1] > 0:
+            return (rv[-1] / rv[-1 - years]) ** (1 / years) - 1
+        return None
+
+    d["growth_last_year"] = cagr(1)
+    d["cagr_3y"] = cagr(3)
+    d["cagr_5y"] = cagr(5)
+    # Default basis: 3-year CAGR (falls back to last-year growth, then 5%).
+    g = next((x for x in (d["cagr_3y"], d["growth_last_year"]) if x is not None), 0.05)
+    d["hist_growth"] = g
+    d["growth_y1"] = _clip(g, -0.10, 0.25)
 
     rev_ttm = snap.v("revenue")
     ebit = snap.v("operating_income")

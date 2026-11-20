@@ -6,8 +6,11 @@ https://finnhub.io/register and store it as FINNHUB_API_KEY (never in the code).
 """
 from __future__ import annotations
 
+import collections
 import csv
 import io
+import threading
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 
@@ -23,9 +26,29 @@ class MarketDataError(Exception):
     pass
 
 
+# App-wide speed limit. Finnhub's free tier allows 60 requests per minute for the whole
+# key, shared by every visitor. The app stops at 50 to leave headroom; above that,
+# visitors see a "busy" message instead of using up the key.
+FINNHUB_BUDGET_PER_MINUTE = 50
+_calls: collections.deque[float] = collections.deque()
+_calls_lock = threading.Lock()
+
+
+def _take_request_slot() -> None:
+    with _calls_lock:
+        now = time.time()
+        while _calls and now - _calls[0] > 60:
+            _calls.popleft()
+        if len(_calls) >= FINNHUB_BUDGET_PER_MINUTE:
+            wait = int(61 - (now - _calls[0]))
+            raise MarketDataError(f"The app is busy (shared live-data limit reached). Try again in about {wait} seconds.")
+        _calls.append(now)
+
+
 def _finnhub(path: str, key: str, **params) -> dict | list:
     if not key:
         raise MarketDataError("No Finnhub API key configured.")
+    _take_request_slot()
     resp = requests.get(f"{FINNHUB}/{path}", params={**params, "token": key}, timeout=20)
     if resp.status_code == 401:
         raise MarketDataError("Finnhub rejected the API key.")

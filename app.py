@@ -55,19 +55,31 @@ def load_snapshot(ticker: str) -> sec.CompanySnapshot:
     return sec.build_snapshot(ticker, SEC_UA, load_ticker_map())
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+# Finnhub results are cached so repeat lookups cost no requests. Failures raise inside
+# the cached function, and Streamlit never caches an exception, so the next visitor retries
+# instead of seeing a remembered error.
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _cached_quote(ticker: str) -> market.Quote:
+    return market.get_quote(ticker, FINNHUB_KEY)
+
+
 def load_quote(ticker: str) -> tuple[market.Quote | None, str | None]:
     try:
-        return market.get_quote(ticker, FINNHUB_KEY), None
+        return _cached_quote(ticker), None
     except Exception as e:  # noqa: BLE001 - show any data problem to the user
         return None, str(e)
 
 
 @st.cache_data(ttl=24 * 3600, show_spinner=False)
+def _cached_beta(ticker: str) -> float | None:
+    return market.get_beta(ticker, FINNHUB_KEY)
+
+
 def load_beta(ticker: str) -> float | None:
     try:
-        return market.get_beta(ticker, FINNHUB_KEY)
-    except Exception:
+        return _cached_beta(ticker)
+    except Exception:  # noqa: BLE001
         return None
 
 
@@ -77,8 +89,15 @@ def load_risk_free() -> market.RiskFree:
 
 
 @st.cache_data(ttl=24 * 3600, show_spinner=False)
-def load_peer_suggestions(ticker: str, sic: str, market_cap: float | None):
+def _cached_peer_suggestions(ticker: str, sic: str, market_cap: float | None):
     return suggest_peers(ticker, sic, market_cap, FINNHUB_KEY, SEC_UA, load_ticker_map())
+
+
+def load_peer_suggestions(ticker: str, sic: str, market_cap: float | None):
+    try:
+        return _cached_peer_suggestions(ticker, sic, market_cap)
+    except market.MarketDataError as e:
+        return [], [f"Competitor suggestions unavailable right now: {e} You can type competitors below."]
 
 
 # ---------------------------------------------------------------------------
@@ -222,17 +241,40 @@ defaults_pct = {
     "tg": DEFAULT_TG * 100, "rf": rf.rate * 100, "beta": wacc_info["beta"], "erp": erp_default * 100,
     "kd": wacc_info["kd"] * 100, "wacc_manual": wacc0 * 100,
 }
+defaults_pct["g1"] = float(f"{defaults_pct['g1']:.1f}")   # match the displayed 3-year CAGR
 for name, val in defaults_pct.items():
     st.session_state.setdefault(K(name), round(float(val), 2))
 st.session_state.setdefault(K("manual"), False)
 
+GROWTH_BASES = {"3-year CAGR": "cagr_3y", "5-year CAGR": "cagr_5y", "Last year's growth": "growth_last_year"}
+st.session_state.setdefault(K("basis"), "3-year CAGR")
+
+
+def apply_growth_basis() -> None:
+    """When the user picks a growth basis, copy that rate into Year 1 growth.
+    Year 5 growth is set halfway between Year 1 and terminal growth."""
+    rate = snap.defaults.get(GROWTH_BASES[st.session_state[K("basis")]])
+    if rate is not None:
+        g1 = float(f"{rate * 100:.1f}")   # same rounding as the displayed CAGR
+        st.session_state[K("g1")] = g1
+        st.session_state[K("g5")] = round((g1 + st.session_state[K("tg")]) / 2, 2)
+
+
 with st.expander("⚙️ Assumptions (defaults come from the company's own history; adjust freely)", expanded=True):
+    st.markdown("**Historical revenue growth** (from fiscal-year 10-K revenue)")
+    h1, h2, h3, h4 = st.columns(4)
+    h1.metric("Last year", pct(snap.defaults.get("growth_last_year")))
+    h2.metric("3-year CAGR", pct(snap.defaults.get("cagr_3y")))
+    h3.metric("5-year CAGR", pct(snap.defaults.get("cagr_5y")))
+    h4.selectbox("Base Year 1 growth on", list(GROWTH_BASES), key=K("basis"), on_change=apply_growth_basis,
+                 help="Copies the chosen historical rate into Year 1 growth. You can still type any value.")
+    st.divider()
     c1, c2, c3, c4 = st.columns(4)
     with c1:
-        st.markdown("**Revenue growth**")
+        st.markdown("**Revenue growth (forecast)**")
         st.number_input("Year 1 growth (%)", step=0.5, key=K("g1"), format="%.1f")
         st.number_input("Year 5 growth (%)", step=0.5, key=K("g5"), format="%.1f")
-        st.caption(f"Historical: {pct(snap.defaults.get('hist_growth'))} (avg of last-year growth and 3-yr CAGR)")
+        st.caption("Growth moves in a straight line from Year 1 to Year 5.")
     with c2:
         st.markdown("**Profitability**")
         st.number_input("Target EBIT margin, year 5 (%)", step=0.5, key=K("margin"), format="%.1f")
@@ -261,7 +303,7 @@ with st.expander("⚙️ Assumptions (defaults come from the company's own histo
             st.number_input("Pre-tax cost of debt (%)", step=0.25, key=K("kd"), format="%.2f",
                             help="Default: interest expense ÷ total debt")
     if st.button("Reset to defaults"):
-        for name in list(defaults_pct) + ["manual"]:
+        for name in list(defaults_pct) + ["manual", "basis"]:
             st.session_state.pop(K(name), None)
         st.rerun()
 
@@ -421,9 +463,10 @@ with tab_rev:
                 f"**{pct(rev.implied_growth)} per year** to justify {per_share(price)} per share.")
             comp = pd.DataFrame({
                 "Benchmark": ["Implied by price", "Your year-1 assumption", "Your year-5 assumption",
-                              "Historical (last-year growth & 3-yr CAGR avg)"],
+                              "Historical: last year", "Historical: 3-year CAGR", "Historical: 5-year CAGR"],
                 "Annual revenue growth": [pct(rev.implied_growth), pct(inputs.growth_y1), pct(inputs.growth_y5),
-                                          pct(snap.defaults.get("hist_growth"))],
+                                          pct(snap.defaults.get("growth_last_year")),
+                                          pct(snap.defaults.get("cagr_3y")), pct(snap.defaults.get("cagr_5y"))],
             })
             st.dataframe(comp, hide_index=True, width="content")
         else:
@@ -478,7 +521,8 @@ with tab_peers:
         peer_pes[p] = p_pe
         row.update({"Company": ps.name, "Price": p_price, "Market cap": (p_price or 0) * (ps.v("shares") or 0) or None,
                     "Revenue (TTM)": ps.v("revenue"), "EBIT margin": ps.defaults.get("op_margin"),
-                    "Hist. growth": ps.defaults.get("hist_growth"), "Trailing P/E": p_pe})
+                    "3-yr CAGR": ps.defaults.get("cagr_3y"), "5-yr CAGR": ps.defaults.get("cagr_5y"),
+                    "Trailing P/E": p_pe})
         if p_price and ps.dcf_supported and ps.v("revenue") and ps.v("shares"):
             try:
                 p_wacc, _ = default_wacc(ps, p_price, load_beta(p) if FINNHUB_KEY else None, rf.rate, DEFAULT_ERP)
@@ -498,19 +542,20 @@ with tab_peers:
     st.markdown("#### Comparison table")
     me = {"Ticker": f"▶ {ticker}", "Company": snap.name, "Price": price, "Market cap": market_cap,
           "Revenue (TTM)": snap.v("revenue"), "EBIT margin": base.margin_start,
-          "Hist. growth": snap.defaults.get("hist_growth"), "Trailing P/E": pe, "WACC": wacc,
+          "3-yr CAGR": snap.defaults.get("cagr_3y"), "5-yr CAGR": snap.defaults.get("cagr_5y"),
+          "Trailing P/E": pe, "WACC": wacc,
           "DCF value / share": dcf.per_share if dcf else None,
           "Upside": dcf.per_share / price - 1 if dcf else None,
           "Implied growth": rev.implied_growth if rev else None, "Notes": "your assumptions"}
     comp = pd.DataFrame([me] + peer_rows)
     show = comp.copy().astype(object)
     for col, f in {"Price": per_share, "Market cap": money, "Revenue (TTM)": money, "EBIT margin": pct,
-                   "Hist. growth": pct, "Trailing P/E": multiple, "WACC": pct, "DCF value / share": per_share,
+                   "3-yr CAGR": pct, "5-yr CAGR": pct, "Trailing P/E": multiple, "WACC": pct, "DCF value / share": per_share,
                    "Upside": pct, "Implied growth": pct}.items():
         if col in show:
             show[col] = [f(v) if v is not None and not (isinstance(v, float) and pd.isna(v)) else "n/a" for v in comp[col]]
     st.dataframe(show.fillna(""), hide_index=True, width="stretch")
-    st.caption("Peers are valued with their own default assumptions (historical growth, current margin, "
+    st.caption("Peers are valued with their own default assumptions (3-year revenue CAGR, current margin, "
                "CAPM WACC, 2.5% terminal growth). Only the selected company uses your custom assumptions.")
 
     st.markdown("#### P/E valuation")
