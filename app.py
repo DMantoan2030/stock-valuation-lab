@@ -17,6 +17,18 @@ from valuation.peers import suggest_peers
 
 st.set_page_config(page_title="Stock Valuation Lab", page_icon="📈", layout="wide")
 
+# Gray Analyze button
+st.markdown("""
+<style>
+[data-testid="stFormSubmitButton"] button {
+    background-color: #6b7280; border: 1px solid #6b7280; color: #ffffff;
+}
+[data-testid="stFormSubmitButton"] button:hover {
+    background-color: #4b5563; border-color: #4b5563; color: #ffffff;
+}
+</style>
+""", unsafe_allow_html=True)
+
 DISCLAIMER = ("**Educational use only. This is not investment advice.** Results depend entirely on the "
               "assumptions entered and on automatically extracted data, which may be incomplete or wrong. "
               "Always verify inputs against the original SEC filings.")
@@ -50,9 +62,18 @@ def load_ticker_map() -> dict:
     return sec.get_ticker_map(SEC_UA)
 
 
+# Bump this whenever the company snapshot gains new fields, so data saved by an older
+# version of the app is not reused after a redeploy.
+SNAPSHOT_VERSION = 2
+
+
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
-def load_snapshot(ticker: str) -> sec.CompanySnapshot:
+def _cached_snapshot(ticker: str, version: int) -> sec.CompanySnapshot:
     return sec.build_snapshot(ticker, SEC_UA, load_ticker_map())
+
+
+def load_snapshot(ticker: str) -> sec.CompanySnapshot:
+    return _cached_snapshot(ticker, SNAPSHOT_VERSION)
 
 
 # Finnhub results are cached so repeat lookups cost no requests. Failures raise inside
