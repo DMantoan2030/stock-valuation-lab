@@ -551,6 +551,8 @@ def _default_assumptions(snap: CompanySnapshot) -> dict[str, float]:
     d["growth_last_year"] = cagr(1)
     d["cagr_3y"] = cagr(3)
     d["cagr_5y"] = cagr(5)
+    # Average of last-year growth and 3-year CAGR (the app's original default)
+    d["growth_blend"] = _avg([d["growth_last_year"], d["cagr_3y"]])
     # Default basis: 3-year CAGR (falls back to last-year growth, then 5%).
     g = next((x for x in (d["cagr_3y"], d["growth_last_year"]) if x is not None), 0.05)
     d["hist_growth"] = g

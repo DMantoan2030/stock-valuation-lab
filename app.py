@@ -64,7 +64,7 @@ def load_ticker_map() -> dict:
 
 # Bump this whenever the company snapshot gains new fields, so data saved by an older
 # version of the app is not reused after a redeploy.
-SNAPSHOT_VERSION = 2
+SNAPSHOT_VERSION = 3
 
 
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
@@ -267,7 +267,8 @@ for name, val in defaults_pct.items():
     st.session_state.setdefault(K(name), round(float(val), 2))
 st.session_state.setdefault(K("manual"), False)
 
-GROWTH_BASES = {"3-year CAGR": "cagr_3y", "5-year CAGR": "cagr_5y", "Last year's growth": "growth_last_year"}
+GROWTH_BASES = {"3-year CAGR": "cagr_3y", "5-year CAGR": "cagr_5y", "Last year's growth": "growth_last_year",
+                "Avg of last year & 3-year CAGR": "growth_blend"}
 st.session_state.setdefault(K("basis"), "3-year CAGR")
 
 
@@ -283,11 +284,12 @@ def apply_growth_basis() -> None:
 
 with st.expander("⚙️ Assumptions (defaults come from the company's own history; adjust freely)", expanded=True):
     st.markdown("**Historical revenue growth** (from fiscal-year 10-K revenue)")
-    h1, h2, h3, h4 = st.columns(4)
+    h1, h2, h3, h4, h5 = st.columns([1, 1, 1, 1.2, 1.6])
     h1.metric("Last year", pct(snap.defaults.get("growth_last_year")))
     h2.metric("3-year CAGR", pct(snap.defaults.get("cagr_3y")))
     h3.metric("5-year CAGR", pct(snap.defaults.get("cagr_5y")))
-    h4.selectbox("Base Year 1 growth on", list(GROWTH_BASES), key=K("basis"), on_change=apply_growth_basis,
+    h4.metric("Avg: last yr & 3-yr", pct(snap.defaults.get("growth_blend")))
+    h5.selectbox("Base Year 1 growth on", list(GROWTH_BASES), key=K("basis"), on_change=apply_growth_basis,
                  help="Copies the chosen historical rate into Year 1 growth. You can still type any value.")
     st.divider()
     c1, c2, c3, c4 = st.columns(4)
@@ -484,10 +486,12 @@ with tab_rev:
                 f"**{pct(rev.implied_growth)} per year** to justify {per_share(price)} per share.")
             comp = pd.DataFrame({
                 "Benchmark": ["Implied by price", "Your year-1 assumption", "Your year-5 assumption",
-                              "Historical: last year", "Historical: 3-year CAGR", "Historical: 5-year CAGR"],
+                              "Historical: last year", "Historical: 3-year CAGR", "Historical: 5-year CAGR",
+                              "Historical: avg of last year & 3-year CAGR"],
                 "Annual revenue growth": [pct(rev.implied_growth), pct(inputs.growth_y1), pct(inputs.growth_y5),
                                           pct(snap.defaults.get("growth_last_year")),
-                                          pct(snap.defaults.get("cagr_3y")), pct(snap.defaults.get("cagr_5y"))],
+                                          pct(snap.defaults.get("cagr_3y")), pct(snap.defaults.get("cagr_5y")),
+                                          pct(snap.defaults.get("growth_blend"))],
             })
             st.dataframe(comp, hide_index=True, width="content")
         else:

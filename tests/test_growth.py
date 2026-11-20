@@ -29,3 +29,5 @@ def test_three_year_cagr_is_default_not_a_blend():
     assert d["cagr_3y"] == pytest.approx(1.5 ** (1 / 3) - 1)
     assert d["cagr_5y"] is None                     # not enough history
     assert d["hist_growth"] == pytest.approx(d["cagr_3y"])
+    # The blend option: simple average of last-year growth and 3-year CAGR
+    assert d["growth_blend"] == pytest.approx((0.50 + (1.5 ** (1 / 3) - 1)) / 2)
