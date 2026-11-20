@@ -52,3 +52,20 @@ def test_keeps_at_most_20_per_key():
     for i in range(25):
         s.save("k", saved(f"s{i}"), now=NOW)
     assert len(s.list("k", now=NOW)) == store.MAX_SCANS_PER_KEY
+
+
+def test_running_scan_found_and_never_expires():
+    s = store.ScanStore()
+    job = store.SavedScan("live", ["AAPL"], [], created=NOW - timedelta(hours=30), status="running")
+    s.save("k", job, now=NOW)
+    assert s.running("k") is job                     # still listed even though it is over 24 hours old
+    job.status = "done"
+    assert s.running("k") is None
+
+
+def test_deleting_a_running_scan_signals_it_to_stop():
+    s = store.ScanStore()
+    job = store.SavedScan("live", ["AAPL"], [], status="running")
+    s.save("k", job, now=NOW)
+    s.delete("k", job.scan_id)
+    assert job.stop.is_set()

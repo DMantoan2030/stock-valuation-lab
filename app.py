@@ -4,7 +4,9 @@ Run locally with:  streamlit run app.py
 """
 from __future__ import annotations
 
+import logging
 import os
+import threading
 import re
 from datetime import datetime, timezone
 import time
@@ -239,53 +241,123 @@ def _open_saved(scan_id: str) -> None:
     if saved:
         st.session_state["scan_rows"] = saved.rows
         st.session_state["scan_name"] = saved.name
+        st.session_state["scan_id"] = saved.scan_id
 
 
 def _delete_saved(scan_id: str) -> None:
     scan_store().delete(STORE_KEY, scan_id)
 
 
-def run_scan(tickers: list[str], name: str = "") -> list[scan.ScanRow]:
-    """Results are written to the session as they arrive, so if the scan is stopped or
-    the user clicks away, the companies already analyzed are kept. Every scan is also
-    saved for 24 hours (partial results included) and listed under Saved scans."""
-    rf = load_risk_free().rate
-    rows: list[scan.ScanRow] = []
-    st.session_state["scan_rows"] = rows
-    name = name.strip() or f"Scan of {len(tickers)} ticker(s)"
-    st.session_state["scan_name"] = name
-    scan_store().save(STORE_KEY, store.SavedScan(name, list(tickers), rows))
-    bar = st.progress(0.0, text="Starting scan...")
+def _current_job() -> store.SavedScan | None:
+    sid = st.session_state.get("scan_id")
+    return scan_store().get(STORE_KEY, sid) if sid else None
+
+
+# The background scan calls the app's cached data loaders from its own thread. Streamlit
+# logs a harmless "missing ScriptRunContext" warning for that; silence it.
+for _name in ("streamlit.runtime.scriptrunner_utils.script_run_context",
+              "streamlit.runtime.scriptrunner.script_run_context"):
+    logging.getLogger(_name).setLevel(logging.ERROR)
+
+
+def _wait(job: store.SavedScan, seconds: float, why: str) -> None:
+    """Sleep in 1-second steps so Stop takes effect quickly, updating the progress message."""
+    end = time.time() + seconds
+    while time.time() < end and not job.stop.is_set():
+        job.message = f"{why} ({end - time.time():.0f}s)"
+        time.sleep(1)
+
+
+def _scan_worker(job: store.SavedScan, rf: float) -> None:
+    """Runs in a background thread on the server, so the person can keep using the app
+    (or even close the tab). Results are appended to job.rows as they finish."""
     window_start, live_calls = time.time(), 0
-    for i, t in enumerate(tickers):
-        bar.progress(i / len(tickers), text=f"Analyzing {t} ({i + 1} of {len(tickers)})")
-        try:
-            snap = load_snapshot(t)
-        except Exception as e:  # noqa: BLE001
-            r = scan.ScanRow(t)
-            r.notes.append(f"SEC data unavailable: {e}")
-            rows.append(r)
-            continue
-        price = beta = None
-        if FINNHUB_KEY:
-            # Finnhub's free tier allows 60 requests per minute. Requests answered from the
-            # app's saved data are instant and do not count; for live ones, pause before
-            # the minute's allowance runs out.
-            if live_calls >= 50 and time.time() - window_start < 60:
-                wait = 61 - (time.time() - window_start)
-                bar.progress(i / len(tickers), text=f"Pausing {wait:.0f}s for Finnhub's 60-requests-per-minute limit...")
-                time.sleep(wait)
-            if time.time() - window_start >= 60:
-                window_start, live_calls = time.time(), 0
-            t0 = time.time()
-            quote, _ = load_quote(t)
-            beta = load_beta(t)
-            if time.time() - t0 > 0.05:
-                live_calls += 2
-            price = quote.price if quote else None
-        rows.append(scan.analyze(snap, price, beta, rf))
-    bar.empty()
-    return rows
+    try:
+        for i, t in enumerate(job.tickers):
+            if job.stop.is_set():
+                job.status, job.message = "stopped", f"Stopped after {job.done} of {len(job.tickers)}"
+                return
+            job.message = f"Analyzing {t} ({i + 1} of {len(job.tickers)})"
+            try:
+                snap = load_snapshot(t)
+            except Exception as e:  # noqa: BLE001
+                r = scan.ScanRow(t)
+                r.notes.append(f"SEC data unavailable: {e}")
+                job.rows.append(r)
+                continue
+            price = beta = None
+            if FINNHUB_KEY:
+                # Finnhub's free tier allows 60 requests per minute. Requests answered from the
+                # app's saved data are instant and do not count; for live ones, pause before
+                # the minute's allowance runs out.
+                if live_calls >= 50 and time.time() - window_start < 60:
+                    _wait(job, 61 - (time.time() - window_start), "Pausing for Finnhub's 60-requests-per-minute limit")
+                if time.time() - window_start >= 60:
+                    window_start, live_calls = time.time(), 0
+                t0 = time.time()
+                quote, err = load_quote(t)
+                if quote is None and err and "rate limit" in err.lower() and not job.stop.is_set():
+                    # Lookups elsewhere in the app used up this minute's allowance: wait and retry once
+                    _wait(job, 61, "Finnhub limit reached by other lookups; waiting")
+                    window_start, live_calls = time.time(), 0
+                    quote, err = load_quote(t)
+                beta = load_beta(t)
+                if time.time() - t0 > 0.05:
+                    live_calls += 2
+                price = quote.price if quote else None
+            job.rows.append(scan.analyze(snap, price, beta, rf))
+        job.status, job.message = "done", f"Finished: {job.done} companies"
+    except Exception as e:  # noqa: BLE001
+        job.status, job.message = "error", f"Scan stopped by an error after {job.done} companies: {e}"
+
+
+def start_scan(tickers: list[str], name: str = "") -> None:
+    """Start a background scan. Only one scan runs at a time, so two scans never compete
+    for the Finnhub allowance."""
+    if scan_store().running(STORE_KEY):
+        return
+    name = name.strip() or f"Scan of {len(tickers)} ticker(s)"
+    job = store.SavedScan(name, list(tickers), [], status="running", message="Starting...")
+    scan_store().save(STORE_KEY, job)
+    st.session_state["scan_rows"] = job.rows
+    st.session_state["scan_name"] = name
+    st.session_state["scan_id"] = job.scan_id
+    rf = load_risk_free().rate
+    threading.Thread(target=_scan_worker, args=(job, rf), daemon=True, name=f"scan-{job.scan_id}").start()
+
+
+def _job_status_text(s: store.SavedScan) -> str:
+    total = len(s.tickers)
+    if s.running:
+        return f"running: {s.done} of {total}"
+    if s.status == "stopped":
+        return f"stopped at {s.done} of {total}"
+    if s.status == "error":
+        return f"error at {s.done} of {total}"
+    return f"{s.done} companies"
+
+
+@st.fragment(run_every=3)
+def _live_progress() -> None:
+    """Refreshes every few seconds while the scan runs: progress, Stop button and results."""
+    job = _current_job()
+    if job is None:
+        return
+    if job.running:
+        st.progress(job.done / max(len(job.tickers), 1), text=job.message)
+        st.button("Stop scan", on_click=job.stop.set, key=f"stop_{job.scan_id}")
+        st.caption("The scan runs in the background: you can switch to Single company, look up other stocks, "
+                   "or close this tab. Results below update as they finish.")
+        _render_results()
+    else:
+        st.rerun()   # finished: redraw the whole page once, without auto-refresh
+
+
+@st.fragment(run_every=5)
+def _sidebar_scan_status() -> None:
+    job = scan_store().running(STORE_KEY)
+    if job:
+        st.caption(f"⏳ Scan \"{job.name}\": {job.done} of {len(job.tickers)}")
 
 
 def render_scan() -> None:
@@ -305,8 +377,7 @@ def render_scan() -> None:
         for s in saved:
             c_name, c_meta, c_open, c_del = st.columns([3, 3, 1, 1])
             c_name.markdown(f"**{s.name}**")
-            status = f"{s.done} of {len(s.tickers)} analyzed" if s.done < len(s.tickers) else f"{s.done} companies"
-            c_meta.caption(f"{status} · {_ago(s.created)}")
+            c_meta.caption(f"{_job_status_text(s)} · {_ago(s.created)}")
             c_open.button("Open", key=f"open_{s.scan_id}", on_click=_open_saved, args=(s.scan_id,))
             c_del.button("Delete", key=f"del_{s.scan_id}", on_click=_delete_saved, args=(s.scan_id,))
 
@@ -333,15 +404,30 @@ def render_scan() -> None:
         # downloads take roughly 1.5 seconds per company. The slower of the two sets the pace.
         est = max(1, round(max(len(tickers) * 2 / 50, len(tickers) * 1.5 / 60)))
         msg = (f"A first scan takes about {est} minute(s); rescans of the same tickers are much faster. "
-               "Results appear as they finish, and anything already analyzed is kept if you stop the scan.")
+               "It runs in the background, so you can keep using the app while it works.")
         (st.warning if est >= 5 else st.caption)(msg)
     scan_name = st.text_input("Name this scan (optional)", placeholder="e.g. Tech watchlist", key="new_scan_name")
-    if st.button("Run scan", type="primary", disabled=not tickers):
-        run_scan(tickers, scan_name)
+    running = scan_store().running(STORE_KEY)
+    if running:
+        st.info(f"A scan is already running (\"{running.name}\", {running.done} of {len(running.tickers)}). "
+                "Stop it or wait for it to finish before starting another.")
+    if st.button("Run scan", type="primary", disabled=not tickers or running is not None):
+        start_scan(tickers, scan_name)
+        st.rerun()
 
-    rows: list[scan.ScanRow] = st.session_state.get("scan_rows") or []
+    job = _current_job()
+    if job is not None and job.running:
+        _live_progress()
+    else:
+        if job is not None and job.status in ("stopped", "error"):
+            st.warning(job.message)
+        _render_results()
+    st.info(DISCLAIMER)
+
+
+def _render_results() -> None:
+    rows: list[scan.ScanRow] = list(st.session_state.get("scan_rows") or [])
     if not rows:
-        st.info(DISCLAIMER)
         return
 
     st.markdown(f"#### {st.session_state.get('scan_name', 'Scan results')}")
@@ -392,8 +478,10 @@ def render_scan() -> None:
     safe_name = re.sub(r"[^A-Za-z0-9]+", "-", st.session_state.get("scan_name", "scan")).strip("-").lower()
     st.download_button("Download results (CSV)", df.to_csv(index=False).encode("utf-8"),
                        file_name=f"{safe_name}-{datetime.now(timezone.utc):%Y-%m-%d}.csv", mime="text/csv")
-    st.info(DISCLAIMER)
 
+
+with st.sidebar:
+    _sidebar_scan_status()   # shows a running background scan on every view
 
 if st.session_state["view"] == "Watchlist scan":
     render_scan()

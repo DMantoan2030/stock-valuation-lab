@@ -29,10 +29,17 @@ class SavedScan:
     rows: list          # list[ScanRow]; the same list object the running scan appends to
     created: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     scan_id: str = field(default_factory=lambda: uuid.uuid4().hex[:10])
+    status: str = "done"            # "running" | "done" | "stopped" | "error"
+    message: str = ""               # what the background scan is doing right now
+    stop: threading.Event = field(default_factory=threading.Event)
 
     @property
     def done(self) -> int:
         return len(self.rows)
+
+    @property
+    def running(self) -> bool:
+        return self.status == "running"
 
 
 class ScanStore:
@@ -42,7 +49,8 @@ class ScanStore:
 
     def _purge(self, now: datetime) -> None:
         for k in list(self._scans):
-            self._scans[k] = [s for s in self._scans[k] if now - s.created < KEEP_FOR]
+            # never drop a scan that is still running
+            self._scans[k] = [s for s in self._scans[k] if s.running or now - s.created < KEEP_FOR]
             if not self._scans[k]:
                 del self._scans[k]
 
@@ -66,4 +74,11 @@ class ScanStore:
     def delete(self, key: str, scan_id: str) -> None:
         with self._lock:
             k = _hash(key)
+            for s in self._scans.get(k, []):
+                if s.scan_id == scan_id:
+                    s.stop.set()            # deleting a running scan also stops it
             self._scans[k] = [s for s in self._scans.get(k, []) if s.scan_id != scan_id]
+
+    def running(self, key: str) -> SavedScan | None:
+        """The scan currently running under this key, if any (only one at a time)."""
+        return next((s for s in self.list(key) if s.running), None)
