@@ -134,6 +134,10 @@ def analyze(snap: CompanySnapshot, price: float | None, beta: float | None, rf: 
             inputs = default_inputs(snap, wacc)
             row.dcf_value = run_dcf(inputs).per_share
             row.upside = row.dcf_value / price - 1
+            if row.dcf_value < 0:
+                row.notes.append("negative DCF value: with default assumptions, current margins and debt "
+                                 "leave no value for shareholders (common for loss-makers or companies "
+                                 "with large finance arms); adjust assumptions in the single-company view")
             row.implied_growth = reverse_dcf(inputs, price).implied_growth
             if row.implied_growth is not None and row.cagr_3y is not None:
                 row.growth_gap = row.implied_growth - row.cagr_3y
