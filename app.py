@@ -5,13 +5,15 @@ Run locally with:  streamlit run app.py
 from __future__ import annotations
 
 import os
+import re
+from datetime import datetime, timezone
 import time
 from dataclasses import replace
 
 import pandas as pd
 import streamlit as st
 
-from valuation import filing, market, scan, sec
+from valuation import filing, market, scan, sec, store
 from valuation.defaults import DEFAULT_ERP, DEFAULT_TG, default_inputs, default_wacc
 from valuation.model import (FCF_FORMULA, MIN_SPREAD, peer_pe_value, reverse_dcf, run_dcf,
                              sensitivity, trailing_pe, wacc_capm)
@@ -217,12 +219,42 @@ def _open_from_scan() -> None:
         st.session_state["view"] = VIEWS[0]
 
 
-def run_scan(tickers: list[str]) -> list[scan.ScanRow]:
+@st.cache_resource
+def scan_store() -> store.ScanStore:
+    """One store shared by all visitors; each person's scans are grouped under their private key."""
+    return store.ScanStore()
+
+
+def _ago(created) -> str:
+    mins = int((datetime.now(timezone.utc) - created).total_seconds() // 60)
+    return "just now" if mins < 1 else f"{mins} min ago" if mins < 60 else f"{mins // 60} h {mins % 60} min ago"
+
+
+# This is a personal app, so all scans are saved in one shared list.
+STORE_KEY = "personal"
+
+
+def _open_saved(scan_id: str) -> None:
+    saved = scan_store().get(STORE_KEY, scan_id)
+    if saved:
+        st.session_state["scan_rows"] = saved.rows
+        st.session_state["scan_name"] = saved.name
+
+
+def _delete_saved(scan_id: str) -> None:
+    scan_store().delete(STORE_KEY, scan_id)
+
+
+def run_scan(tickers: list[str], name: str = "") -> list[scan.ScanRow]:
     """Results are written to the session as they arrive, so if the scan is stopped or
-    the user clicks away, the companies already analyzed are kept."""
+    the user clicks away, the companies already analyzed are kept. Every scan is also
+    saved for 24 hours (partial results included) and listed under Saved scans."""
     rf = load_risk_free().rate
     rows: list[scan.ScanRow] = []
     st.session_state["scan_rows"] = rows
+    name = name.strip() or f"Scan of {len(tickers)} ticker(s)"
+    st.session_state["scan_name"] = name
+    scan_store().save(STORE_KEY, store.SavedScan(name, list(tickers), rows))
     bar = st.progress(0.0, text="Starting scan...")
     window_start, live_calls = time.time(), 0
     for i, t in enumerate(tickers):
@@ -262,6 +294,22 @@ def render_scan() -> None:
         "Value every company on a watchlist with the app's default assumptions, then rank them by upside, "
         "financial distress, or the gap between the growth the stock price implies and the company's "
         "3-year revenue CAGR. **Click any row to open the full single-company analysis.**")
+
+    with st.container(border=True):
+        st.markdown("**Saved scans (kept 24 hours)**")
+        saved = scan_store().list(STORE_KEY)
+        if not saved:
+            st.caption("Scans you run are saved here automatically for 24 hours, so you can reopen them without "
+                       "re-scanning. They can disappear early if the app restarts; use Download CSV to keep "
+                       "results longer.")
+        for s in saved:
+            c_name, c_meta, c_open, c_del = st.columns([3, 3, 1, 1])
+            c_name.markdown(f"**{s.name}**")
+            status = f"{s.done} of {len(s.tickers)} analyzed" if s.done < len(s.tickers) else f"{s.done} companies"
+            c_meta.caption(f"{status} · {_ago(s.created)}")
+            c_open.button("Open", key=f"open_{s.scan_id}", on_click=_open_saved, args=(s.scan_id,))
+            c_del.button("Delete", key=f"del_{s.scan_id}", on_click=_delete_saved, args=(s.scan_id,))
+
     with st.expander("How to get your tickers in"):
         st.markdown(
             "- **Paste:** type or paste tickers in any format (commas, spaces or one per line). If your "
@@ -287,14 +335,16 @@ def render_scan() -> None:
         msg = (f"A first scan takes about {est} minute(s); rescans of the same tickers are much faster. "
                "Results appear as they finish, and anything already analyzed is kept if you stop the scan.")
         (st.warning if est >= 5 else st.caption)(msg)
+    scan_name = st.text_input("Name this scan (optional)", placeholder="e.g. Tech watchlist", key="new_scan_name")
     if st.button("Run scan", type="primary", disabled=not tickers):
-        run_scan(tickers)
+        run_scan(tickers, scan_name)
 
     rows: list[scan.ScanRow] = st.session_state.get("scan_rows") or []
     if not rows:
         st.info(DISCLAIMER)
         return
 
+    st.markdown(f"#### {st.session_state.get('scan_name', 'Scan results')}")
     sort = st.radio("Rank by", list(SORTS), horizontal=True, key="scan_sort")
     sectors = sorted({r.sector for r in rows if r.sector})
     chosen = st.multiselect("Filter by sector", sectors, placeholder="All sectors", key="scan_sectors")
@@ -339,6 +389,9 @@ def render_scan() -> None:
                "(3-year revenue CAGR, current margin, CAPM WACC, 2.5% terminal growth), so treat the ranking "
                "as a starting point for research. Altman Z zones: below 1.81 distress, 1.81 to 2.99 grey, "
                "above 2.99 safe; it is not meaningful for banks, insurers or REITs.")
+    safe_name = re.sub(r"[^A-Za-z0-9]+", "-", st.session_state.get("scan_name", "scan")).strip("-").lower()
+    st.download_button("Download results (CSV)", df.to_csv(index=False).encode("utf-8"),
+                       file_name=f"{safe_name}-{datetime.now(timezone.utc):%Y-%m-%d}.csv", mime="text/csv")
     st.info(DISCLAIMER)
 
 
